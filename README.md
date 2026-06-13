@@ -43,8 +43,8 @@ cd your-project
 claude-box            # first run builds the image, then launches Claude in auto mode
 ```
 
-- **First run** builds the base image (a few minutes) and drops you into Claude. You'll be asked to
-  `/login` once inside the box (see [Authentication](#authentication)).
+- **First run** builds the base image (a few minutes) and drops you into Claude. Authenticate with a
+  host-minted token first — the box can't run interactive login (see [Authentication](#authentication)).
 - **No dependencies needed?** It just works in any directory — even an empty one — using the base
   image (Node, git, jq, ripgrep, curl, unzip, build tools).
 - **Need project deps?** Scaffold a tiny Dockerfile and add them:
@@ -73,10 +73,10 @@ Three layers, generic → specific:
 | ------------------------ | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `$PWD`                   | `$PWD` (same absolute path) | So Claude's per-project history/memory keys match the host. Edit/commit/push from your host as usual.                                                                        |
 | `~/.claude`              | `~/.claude`                 | Read-write: skills, `settings.json`/statusline edits, memories, and credentials written in the box persist to the host. Also mounted at the host home path so absolute `~`-style config paths (e.g. a statusLine command) resolve.                                                                                                                     |
-| `~/.claude.json`         | seeded into a home volume   | Top-level config. Bind-mounting the file directly breaks Claude's atomic-rename writes, so it's seeded once into the container's home and kept container-local from then on. |
+| `~/.claude.json`         | regenerated in a home volume | Top-level config. Bind-mounting the file directly breaks Claude's atomic-rename writes, so each run it's regenerated into the container home from yours **with `.oauthAccount` stripped** — the box authenticates via `CLAUDE_CODE_OAUTH_TOKEN`, not the host account (whose creds are in the Keychain). Container-local otherwise. |
 | `~/.gitconfig`           | `~/.gitconfig` (ro)         | Commit identity (if present).                                                                                                                                                |
 | a named volume           | container `~`               | Persists caches (e.g. language package caches) between runs.                                                                                                                 |
-| `~/.agents` (if present) | container `~/.agents`       | For tools that symlink into `~/.claude` with relative links. Configurable — see [Configuration](#configuration).                                                                                                                                            |
+| `~/.agents` (if present) | container `~/.agents` (ro)  | For tools that symlink into `~/.claude` with relative links. Read-only — the box reads these but shouldn't rewrite them on the host. Configurable — see [Configuration](#configuration).                                                                                                                                            |
 
 The container runs as the non-root `node` user with `IS_SANDBOX=1` so auto mode is allowed, and
 `git`'s `safe.directory` is set so in-container git works on the bind-mounted repo.
@@ -101,35 +101,41 @@ it's naturally tracked with your project config. See [`examples/`](examples/) fo
 
 ## Authentication
 
-Claude Code on macOS stores OAuth credentials in the **Keychain**, which a Linux container can't
-read. So on your first `claude-box` run, just `/login` inside the box. On Linux, Claude writes
-credentials to `~/.claude/.credentials.json` — which is in the mounted `~/.claude` — so every later
-run is already authenticated and you keep your subscription. `ANTHROPIC_API_KEY` /
-`ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_BASE_URL` are also forwarded if set.
+**Authenticate once on the host with a token — the box can't run interactive login.** Claude on
+macOS keeps credentials in the **Keychain** (which the Linux box can't read), and an in-box `/login`
+can't finish: it uses a loopback OAuth callback on a **random container-internal `localhost` port**
+the host can't reach (Docker `-p` can't target a container-loopback listener, and Docker Desktop
+host networking doesn't bridge it), and there's no flag/env to force the paste-a-code flow on the
+interactive client. So mint a long-lived token instead:
+
+```sh
+claude setup-token                 # on your Mac — host browser + loopback work here
+export CLAUDE_CODE_OAUTH_TOKEN=…   # add to your shell profile
+```
+
+claude-box forwards `CLAUDE_CODE_OAUTH_TOKEN` into the box, so it's authenticated on startup — no
+login prompt, no browser, no localhost. `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` /
+`ANTHROPIC_BASE_URL` also work if set. (No host machine? `claude setup-token --no-browser` works
+anywhere — including inside the box — and prints a token via a paste-a-code flow.)
 
 ## Sounds
 
-If you have hooks that play sounds with macOS `afplay` (e.g. a `Stop` hook running
-`afplay /System/Library/Sounds/Glass.aiff`), those run _inside_ the container — where there's no
-`afplay` and no audio device. claude-box handles this transparently:
-
-- The base image ships a shim named `afplay` that, instead of playing locally, drops its arguments
-  into a shared spool directory.
-- The launcher runs a small background watcher on the **host** that plays queued requests with your
-  real player (`afplay` by default).
-
-No hook changes needed. Disable with `CLAUDE_BOX_NO_AUDIO=1`; change the host player with
-`CLAUDE_BOX_PLAYER`.
+The container has no audio device, so hooks that call macOS `afplay` (e.g. a `Stop` hook running
+`afplay /System/Library/Sounds/Glass.aiff`) would fail. The base image ships an `afplay` shim that
+drops its args into a shared spool dir, and a small background watcher in the launcher plays them
+with your host player. No hook changes needed. Disable with `CLAUDE_BOX_NO_AUDIO=1`; override the
+player with `CLAUDE_BOX_PLAYER`. macOS host only; skipped if the player isn't found.
 
 ## Security
 
 **Auto mode is the whole point, so think about the trust boundary.** The container can run anything,
 but can only reach what you mount. Two things to know:
 
-- **Read-write mounts are reachable.** `~/.claude`, the repo, and any extra mounts are mounted
-  read-write, so a misbehaving agent can modify _those host paths_ directly (e.g. deleting files
-  under `~/.claude`). Everything else on your machine is protected by the container. Mount only what
-  you're comfortable exposing.
+- **Read-write mounts are reachable.** `~/.claude`, the repo, and any `CLAUDE_BOX_MOUNTS` paths are
+  mounted read-write, so a misbehaving agent can modify _those host paths_ directly (e.g. deleting
+  files under `~/.claude`). `CLAUDE_BOX_HOME_MOUNTS` (default `.agents`) are mounted read-only.
+  Everything else on your machine is protected by the container. Mount only what you're comfortable
+  exposing.
 - **The sound channel is not an injection vector.** The watcher reads each request into an array and
   passes it to the player as quoted argv — there's no `eval` / `sh -c`, so shell metacharacters in a
   request (`;`, `$()`, backticks, …) are inert literal filenames. As an extra safeguard, the watcher
@@ -143,9 +149,10 @@ All optional environment variables:
 | Variable                                                            | Default   | Purpose                                                                                                                                                                                                    |
 | ------------------------------------------------------------------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `CLAUDE_BOX_MOUNTS`                                                 | —         | Space-separated host paths to bind-mount at the **same absolute path** in the box (e.g. absolute symlink targets, shared dirs outside the repo).                                                           |
-| `CLAUDE_BOX_HOME_MOUNTS`                                            | `.agents` | Space-separated names under `$HOME` mounted at the same name under the container home — for tools that symlink into `~/.claude` with **relative** links (the target must sit beside `.claude` in `$HOME`). |
+| `CLAUDE_BOX_HOME_MOUNTS`                                            | `.agents` | Space-separated names under `$HOME` mounted **read-only** at the same name under the container home — for tools that symlink into `~/.claude` with **relative** links (the target must sit beside `.claude` in `$HOME`). |
 | `CLAUDE_BOX_PLAYER`                                                 | `afplay`  | Host command used to play forwarded sounds.                                                                                                                                                                |
 | `CLAUDE_BOX_NO_AUDIO`                                               | —         | Set to disable sound forwarding.                                                                                                                                                                           |
+| `CLAUDE_CODE_OAUTH_TOKEN`                                           | —         | Host-minted token (`claude setup-token`); forwarded so the box authenticates without an in-box login.                                                                                                      |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_BASE_URL` | —         | Forwarded into the container if set.                                                                                                                                                                       |
 
 ### Options

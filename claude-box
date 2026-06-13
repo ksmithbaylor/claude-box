@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-CLAUDE_BOX_VERSION="0.1.0"
+CLAUDE_BOX_VERSION="0.4.1"
 PROJECT_DOCKERFILE=".claude/claude-box/Dockerfile"
 CONTAINER_HOME="/home/node"   # home of the non-root 'node' user in the base image
 
@@ -47,38 +47,50 @@ WHAT IT DOES:
     (so Claude's per-project history/memory line up), your ~/.claude mounted,
     a persistent home volume for caches, and Claude started in auto mode.
 
-FIRST RUN / AUTH:
-  Claude can't read the macOS Keychain from inside Linux, so on first run use
-  /login inside the box. Credentials are written under the mounted ~/.claude and
-  persist for later runs. ANTHROPIC_API_KEY (etc.) are forwarded if set.
+AUTH (do this once on the HOST — the box can't run interactive login):
+  Claude on macOS keeps credentials in the Keychain (which the Linux box can't
+  read), and an in-box /login can't finish — it uses a loopback OAuth callback on
+  a random container-internal port the host can't reach, and there's no flag/env
+  to force the paste-a-code flow on the interactive client. So authenticate with
+  a host-minted token instead:
+    1. On your Mac:  claude setup-token        (host browser + loopback work here)
+    2. export CLAUDE_CODE_OAUTH_TOKEN=...      (add to your shell profile)
+  claude-box forwards it into the box, so the box is authenticated on startup
+  with no login prompt, no browser, no localhost. ANTHROPIC_API_KEY /
+  ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL also work if set.
 
 SOUNDS:
-  macOS `afplay` isn't in the container, so hooks that call it would fail. A
-  shim named `afplay` in the container forwards requests to a host-side player
-  via a shared spool dir; the launcher plays them with your real player. No
-  shell evaluation happens, and only existing files with an audio extension are
-  played (see README "Security").
+  The container has no audio device, so hooks that call macOS `afplay` would
+  fail. A shim named `afplay` forwards requests to a host-side watcher that plays
+  them with your real player. No shell evaluation happens; only existing files
+  with an audio extension are played (see README "Security").
 
 ENVIRONMENT:
   CLAUDE_BOX_MOUNTS       Space-separated host paths to bind-mount at the SAME
                           absolute path inside the box (e.g. absolute symlink
                           targets, or shared dirs outside the repo).
-  CLAUDE_BOX_HOME_MOUNTS  Space-separated names under $HOME to mount at the same
-                          name under the container home. Default ".agents".
-                          For tools that symlink into ~/.claude with relative
-                          links (the target must sit beside .claude in $HOME).
-  CLAUDE_BOX_PLAYER       Host command used to play forwarded sounds.
-                          Default "afplay" (macOS).
+  CLAUDE_BOX_HOME_MOUNTS  Space-separated names under $HOME to mount (read-only)
+                          at the same name under the container home. Default
+                          ".agents". For tools that symlink into ~/.claude with
+                          relative links (the target must sit beside .claude in
+                          $HOME). Read-only: the box reads these but shouldn't
+                          rewrite them on the host.
+  CLAUDE_BOX_PLAYER       Host command to play forwarded sounds. Default "afplay".
   CLAUDE_BOX_NO_AUDIO     Set to anything to disable sound forwarding.
+  CLAUDE_CODE_OAUTH_TOKEN Host-minted token (`claude setup-token`); forwarded so
+                          the box is authenticated without an in-box login.
   ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL
                           Forwarded into the container if set.
 
 CAVEATS:
-  - The repo, ~/.claude, and any extra mounts are bind-mounted read-write, so a
-    misbehaving agent in auto mode can modify THOSE host paths directly. The
-    sandbox protects everything else. Mount only what you're comfortable with.
-  - Top-level ~/.claude.json is container-local (seeded from yours on first
-    run); everything under ~/.claude/ stays host-shared.
+  - The repo, ~/.claude, and any CLAUDE_BOX_MOUNTS paths are bind-mounted
+    read-write, so a misbehaving agent in auto mode can modify THOSE host paths
+    directly. CLAUDE_BOX_HOME_MOUNTS (default .agents) are read-only. The sandbox
+    protects everything else. Mount only what you're comfortable with.
+  - Top-level ~/.claude.json is container-local: regenerated each run from yours
+    with the OAuth account (.oauthAccount) stripped, so the box authenticates via
+    CLAUDE_CODE_OAUTH_TOKEN rather than expecting the host account's credentials.
+    Everything under ~/.claude/ stays host-shared.
 EOF
 }
 
@@ -94,11 +106,20 @@ ARG CLAUDE_VERSION=latest
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_VERSION}
 RUN mkdir -p /home/node/.cache && chown -R node:node /home/node
 
-# Seed ~/.claude.json from the host on first run, then exec the real command.
+# Seed ~/.claude.json from the host each run, but STRIP the host's OAuth account
+# (.oauthAccount): inside the box that account has no credentials (they live in
+# the host Keychain), so leaving it makes Claude prompt to log in and re-onboard
+# instead of using $CLAUDE_CODE_OAUTH_TOKEN. Regenerated every start so stale
+# volumes self-heal. Keeps the rest (onboarding-complete, MCP config, etc.).
 COPY <<'SH' /usr/local/bin/claude-box-entry
 #!/bin/sh
-if [ -f /seed/.claude.json ] && [ ! -f "$HOME/.claude.json" ]; then
-  cp /seed/.claude.json "$HOME/.claude.json"
+if [ -f /seed/.claude.json ]; then
+  if command -v jq >/dev/null 2>&1 \
+     && jq 'del(.oauthAccount)' /seed/.claude.json > "$HOME/.claude.json.tmp" 2>/dev/null; then
+    mv "$HOME/.claude.json.tmp" "$HOME/.claude.json"
+  elif [ ! -f "$HOME/.claude.json" ]; then
+    cp /seed/.claude.json "$HOME/.claude.json"
+  fi
 fi
 exec "$@"
 SH
@@ -161,6 +182,24 @@ command -v docker >/dev/null 2>&1 || {
   exit 1
 }
 
+# --- auth check ------------------------------------------------------------
+# The box can't run interactive login (its OAuth callback can't reach the host),
+# so it needs auth from the host. Bail early with guidance if none is visible,
+# rather than dropping into a doomed login prompt. NOTE: env vars must be
+# *exported* to be seen here (and forwarded); `export CLAUDE_CODE_OAUTH_TOKEN=…`.
+if [ -z "${CLAUDE_BOX_SKIP_AUTH_CHECK:-}" ] \
+   && [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] \
+   && [ -z "${ANTHROPIC_API_KEY:-}" ] \
+   && [ -z "${ANTHROPIC_AUTH_TOKEN:-}" ] \
+   && [ ! -f "$HOME/.claude/.credentials.json" ]; then
+  echo "claude-box: no auth found, and the box can't run interactive login." >&2
+  echo "  Mint a token on the host and export it (then re-run):" >&2
+  echo "    claude setup-token && export CLAUDE_CODE_OAUTH_TOKEN=…" >&2
+  echo "  Alternatives: export ANTHROPIC_API_KEY, or pre-authenticate ~/.claude." >&2
+  echo "  Bypass this check with CLAUDE_BOX_SKIP_AUTH_CHECK=1." >&2
+  exit 1
+fi
+
 # --- build base image (hash-tagged so it rebuilds only when its def changes) ---
 BASE_HASH=$(printf '%s' "$BASE_DOCKERFILE" | shasum | cut -c1-12)
 BASE_TAG="claude-box-base:$BASE_HASH"
@@ -197,29 +236,42 @@ GITCFG=()
 HOMEMAP=()
 mount_home() {
   [ -e "$HOME/$1" ] || return 0
-  HOMEMAP+=(-v "$HOME/$1:$CONTAINER_HOME/$1")
-  [ "$HOME" != "$CONTAINER_HOME" ] && HOMEMAP+=(-v "$HOME/$1:$HOME/$1")
+  local opt="${2:+:$2}"
+  HOMEMAP+=(-v "$HOME/$1:$CONTAINER_HOME/$1$opt")
+  [ "$HOME" != "$CONTAINER_HOME" ] && HOMEMAP+=(-v "$HOME/$1:$HOME/$1$opt")
 }
+# .claude stays read-write: the box legitimately writes memories, installs
+# skills, and updates settings there. CLAUDE_BOX_HOME_MOUNTS entries (default
+# .agents) are symlink targets / shared resources the box only reads, so they're
+# mounted read-only — a misbehaving agent can't rewrite them on the host.
 mount_home .claude
 : "${CLAUDE_BOX_HOME_MOUNTS:=.agents}"
-for name in ${CLAUDE_BOX_HOME_MOUNTS:-}; do mount_home "$name"; done
+for name in ${CLAUDE_BOX_HOME_MOUNTS:-}; do mount_home "$name" ro; done
 
 # CLAUDE_BOX_MOUNTS: arbitrary host paths mounted at their SAME absolute path.
 EXTRA=()
 for m in ${CLAUDE_BOX_MOUNTS:-}; do EXTRA+=(-v "$m:$m"); done
 
 ENVPASS=()
-[ -n "${ANTHROPIC_API_KEY:-}" ]    && ENVPASS+=(-e ANTHROPIC_API_KEY)
-[ -n "${ANTHROPIC_AUTH_TOKEN:-}" ] && ENVPASS+=(-e ANTHROPIC_AUTH_TOKEN)
-[ -n "${ANTHROPIC_BASE_URL:-}" ]   && ENVPASS+=(-e ANTHROPIC_BASE_URL)
+[ -n "${ANTHROPIC_API_KEY:-}" ]      && ENVPASS+=(-e ANTHROPIC_API_KEY)
+[ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]   && ENVPASS+=(-e ANTHROPIC_AUTH_TOKEN)
+[ -n "${ANTHROPIC_BASE_URL:-}" ]     && ENVPASS+=(-e ANTHROPIC_BASE_URL)
+# A token minted on the host (`claude setup-token`) authenticates the box with no
+# in-box /login — the box can't complete the localhost OAuth callback.
+[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && ENVPASS+=(-e CLAUDE_CODE_OAUTH_TOKEN)
 
 CMD=(claude)
 [ "$AUTO" = 1 ] && CMD+=(--dangerously-skip-permissions)
 
-# --- audio: play container sounds on the host ------------------------------
-# The container's afplay shim drops requests into a shared spool dir; this
-# background watcher plays them with the host player. Skipped if the player is
-# absent (e.g. non-macOS host) or CLAUDE_BOX_NO_AUDIO is set.
+# --- audio: play container hook sounds on the host -------------------------
+# The container's afplay shim drops requests into a shared spool; this background
+# watcher plays them with the host player. Skipped if the player is absent
+# (e.g. non-macOS host) or CLAUDE_BOX_NO_AUDIO is set.
+#
+# (There is deliberately no browser/URL forwarding: Claude's login uses a
+# loopback OAuth callback on a random container-internal port the host can't
+# reach, so opening the host browser would only lead to a dead callback. Use a
+# host-minted CLAUDE_CODE_OAUTH_TOKEN instead — see AUTH in --help.)
 : "${CLAUDE_BOX_PLAYER:=afplay}"
 AUDIO_RUN=()
 if [ -z "${CLAUDE_BOX_NO_AUDIO:-}" ] && command -v "$CLAUDE_BOX_PLAYER" >/dev/null 2>&1; then
@@ -228,10 +280,9 @@ if [ -z "${CLAUDE_BOX_NO_AUDIO:-}" ] && command -v "$CLAUDE_BOX_PLAYER" >/dev/nu
   AUDIO_RUN=(-e "CLAUDE_BOX_AUDIO_SPOOL=/claude-box-audio" -v "$AUDIO_SPOOL:/claude-box-audio")
   (
     set +e
-    # Safeguard: only play if the request's file argument (conventionally last)
-    # is an existing regular file with a known audio extension. Bounds a
-    # malicious/buggy request to playing real sound files — never an arbitrary
-    # path, flag, or injection string. Args are passed as quoted argv (no eval).
+    # Safeguard: only play an existing regular file with a known audio extension
+    # — never an arbitrary path, flag, or injection string. Args are passed as
+    # quoted argv (no eval); symlinked requests are ignored.
     audio_ok() {
       [ "$#" -gt 0 ] || return 1
       local last ext
@@ -246,7 +297,7 @@ if [ -z "${CLAUDE_BOX_NO_AUDIO:-}" ] && command -v "$CLAUDE_BOX_PLAYER" >/dev/nu
     while [ -d "$AUDIO_SPOOL" ]; do
       for f in "$AUDIO_SPOOL"/req.*; do
         [ -e "$f" ] || continue
-        if [ -L "$f" ]; then rm -f "$f"; continue; fi   # ignore symlinked requests
+        if [ -L "$f" ]; then rm -f "$f"; continue; fi
         args=(); while IFS= read -r line; do args+=("$line"); done < "$f"
         rm -f "$f"
         audio_ok "${args[@]}" && "$CLAUDE_BOX_PLAYER" "${args[@]}" >/dev/null 2>&1 &
