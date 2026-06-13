@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+#
+# claude-box — run Claude Code in a per-project Docker sandbox.
+#
+# Runs Claude Code in "auto mode" (--dangerously-skip-permissions) inside a
+# container so it can't touch your host. Your repo and global ~/.claude are
+# bind-mounted (so editing, committing, skills, memory, and settings all work as
+# usual), every toolchain dependency lives in the container, and macOS hook
+# sounds are forwarded back to the host. See README.md for the full design.
+#
+# This script is self-contained: the base image is defined inline and built on
+# first use. The only per-project file is .claude/claude-box/Dockerfile, which
+# FROMs the base image and installs that project's dependencies (optional).
+#
+# Targets a macOS host with Docker Desktop. Requires: docker, bash.
+
+set -euo pipefail
+
+CLAUDE_BOX_VERSION="0.1.0"
+PROJECT_DOCKERFILE=".claude/claude-box/Dockerfile"
+CONTAINER_HOME="/home/node"   # home of the non-root 'node' user in the base image
+
+usage() {
+  cat <<'EOF'
+claude-box — run Claude Code in a per-project Docker sandbox.
+
+USAGE:
+  claude-box [options] [-- claude args...]
+
+OPTIONS:
+  --init        Scaffold .claude/claude-box/Dockerfile in the current repo.
+  --rebuild     Force a rebuild of the base and project images (no cache).
+  --no-auto     Don't pass --dangerously-skip-permissions to Claude.
+  -h, --help    Show this help.
+  --version     Print the version.
+
+  Anything after the options (or after a literal `--`) is passed through to
+  `claude`. Use `--` to pass flags, e.g.:  claude-box -- --resume
+
+WHAT IT DOES:
+  - Builds a base image (Node + Claude Code + git/jq/ripgrep/curl/unzip/build
+    tools), cached and reused across projects.
+  - If the repo has .claude/claude-box/Dockerfile, builds a project image from
+    it (FROM the base + your deps). Otherwise runs the base image directly — so
+    it works in an empty directory with no setup.
+  - Runs the container with your repo bind-mounted at the SAME absolute path
+    (so Claude's per-project history/memory line up), your ~/.claude mounted,
+    a persistent home volume for caches, and Claude started in auto mode.
+
+FIRST RUN / AUTH:
+  Claude can't read the macOS Keychain from inside Linux, so on first run use
+  /login inside the box. Credentials are written under the mounted ~/.claude and
+  persist for later runs. ANTHROPIC_API_KEY (etc.) are forwarded if set.
+
+SOUNDS:
+  macOS `afplay` isn't in the container, so hooks that call it would fail. A
+  shim named `afplay` in the container forwards requests to a host-side player
+  via a shared spool dir; the launcher plays them with your real player. No
+  shell evaluation happens, and only existing files with an audio extension are
+  played (see README "Security").
+
+ENVIRONMENT:
+  CLAUDE_BOX_MOUNTS       Space-separated host paths to bind-mount at the SAME
+                          absolute path inside the box (e.g. absolute symlink
+                          targets, or shared dirs outside the repo).
+  CLAUDE_BOX_HOME_MOUNTS  Space-separated names under $HOME to mount at the same
+                          name under the container home. Default ".agents".
+                          For tools that symlink into ~/.claude with relative
+                          links (the target must sit beside .claude in $HOME).
+  CLAUDE_BOX_PLAYER       Host command used to play forwarded sounds.
+                          Default "afplay" (macOS).
+  CLAUDE_BOX_NO_AUDIO     Set to anything to disable sound forwarding.
+  ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL
+                          Forwarded into the container if set.
+
+CAVEATS:
+  - The repo, ~/.claude, and any extra mounts are bind-mounted read-write, so a
+    misbehaving agent in auto mode can modify THOSE host paths directly. The
+    sandbox protects everything else. Mount only what you're comfortable with.
+  - Top-level ~/.claude.json is container-local (seeded from yours on first
+    run); everything under ~/.claude/ stays host-shared.
+EOF
+}
+
+# --- embedded base image: Node + Claude Code + common CLI tools -------------
+read -r -d '' BASE_DOCKERFILE <<'DOCKERFILE' || true
+# syntax=docker/dockerfile:1
+FROM node:22-bookworm-slim
+ENV DEBIAN_FRONTEND=noninteractive IS_SANDBOX=1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git jq ripgrep curl ca-certificates less build-essential python3 unzip \
+ && rm -rf /var/lib/apt/lists/*
+ARG CLAUDE_VERSION=latest
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_VERSION}
+RUN mkdir -p /home/node/.cache && chown -R node:node /home/node
+
+# Seed ~/.claude.json from the host on first run, then exec the real command.
+COPY <<'SH' /usr/local/bin/claude-box-entry
+#!/bin/sh
+if [ -f /seed/.claude.json ] && [ ! -f "$HOME/.claude.json" ]; then
+  cp /seed/.claude.json "$HOME/.claude.json"
+fi
+exec "$@"
+SH
+
+# afplay shim: there's no audio device in the container, so forward the request
+# to the host player by dropping the args into the shared spool dir that the
+# launcher watches. No-op if audio forwarding isn't set up.
+COPY <<'SH' /usr/local/bin/afplay
+#!/bin/sh
+[ "$#" -gt 0 ] || exit 0
+d="${CLAUDE_BOX_AUDIO_SPOOL:-}"
+[ -n "$d" ] && [ -d "$d" ] || exit 0
+t=$(mktemp "$d/tmp.XXXXXX") || exit 0
+for a in "$@"; do printf '%s\n' "$a"; done > "$t"
+mv "$t" "$d/req.${t##*/}"
+SH
+
+RUN chmod +x /usr/local/bin/claude-box-entry /usr/local/bin/afplay
+ENTRYPOINT ["claude-box-entry"]
+DOCKERFILE
+
+do_init() {
+  mkdir -p "$(dirname "$PROJECT_DOCKERFILE")"
+  if [ -e "$PROJECT_DOCKERFILE" ]; then
+    echo "$PROJECT_DOCKERFILE already exists — leaving it alone." >&2
+    return 1
+  fi
+  cat > "$PROJECT_DOCKERFILE" <<'TMPL'
+# Per-project dev image for claude-box. FROM the shared base, add project deps.
+ARG BASE_IMAGE=claude-box-base:latest
+FROM ${BASE_IMAGE}
+
+# Example — Deno (remove/replace with this project's toolchain):
+# ARG DENO_VERSION=2.4.2
+# RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s "v${DENO_VERSION}"
+
+USER node
+TMPL
+  echo "Wrote $PROJECT_DOCKERFILE — edit it, then run: claude-box"
+}
+
+# --- parse options ---------------------------------------------------------
+AUTO=1
+REBUILD=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --version) echo "claude-box $CLAUDE_BOX_VERSION"; exit 0 ;;
+    --init) do_init; exit $? ;;
+    --rebuild) REBUILD=1; shift ;;
+    --no-auto) AUTO=0; shift ;;
+    --) shift; break ;;
+    -*) echo "claude-box: unknown option: $1 (use -- to pass flags to claude)" >&2; exit 2 ;;
+    *) break ;;
+  esac
+done
+
+command -v docker >/dev/null 2>&1 || {
+  echo "Docker not found — install Docker Desktop (brew install --cask docker) and start it." >&2
+  exit 1
+}
+
+# --- build base image (hash-tagged so it rebuilds only when its def changes) ---
+BASE_HASH=$(printf '%s' "$BASE_DOCKERFILE" | shasum | cut -c1-12)
+BASE_TAG="claude-box-base:$BASE_HASH"
+if [ -n "$REBUILD" ] || ! docker image inspect "$BASE_TAG" >/dev/null 2>&1; then
+  echo "claude-box: building base image $BASE_TAG ..." >&2
+  printf '%s' "$BASE_DOCKERFILE" | docker build -t "$BASE_TAG" -
+fi
+
+# --- project image if this repo has one, else run the base directly --------
+if [ -f "$PROJECT_DOCKERFILE" ]; then
+  SLUG=$(basename "$PWD" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_.-' '-' | sed 's/^[-.]*//; s/[-.]*$//')
+  [ -n "$SLUG" ] || SLUG=repo
+  RUN_IMAGE="claude-box-proj-$SLUG:latest"
+  echo "claude-box: building project image $RUN_IMAGE ..." >&2
+  docker build ${REBUILD:+--no-cache} -t "$RUN_IMAGE" \
+    --build-arg "BASE_IMAGE=$BASE_TAG" \
+    -f "$PROJECT_DOCKERFILE" "$(dirname "$PROJECT_DOCKERFILE")"
+else
+  RUN_IMAGE="$BASE_TAG"
+  echo "claude-box: no $PROJECT_DOCKERFILE — using the base image (run 'claude-box --init' to add project deps)." >&2
+fi
+
+# --- assemble mounts -------------------------------------------------------
+VOL="claude-box-home-$(printf '%s' "$PWD" | shasum | cut -c1-12)"
+
+GITCFG=()
+[ -f "$HOME/.gitconfig" ] && GITCFG=(-v "$HOME/.gitconfig:$CONTAINER_HOME/.gitconfig:ro")
+
+# Extra mounts:
+#  - CLAUDE_BOX_HOME_MOUNTS: names under $HOME mounted at the same name under the
+#    container home (default ".agents"), for tools that symlink into ~/.claude
+#    with RELATIVE links resolving home-relative.
+#  - CLAUDE_BOX_MOUNTS: host paths mounted at their SAME absolute path.
+EXTRA=()
+: "${CLAUDE_BOX_HOME_MOUNTS:=.agents}"
+for name in ${CLAUDE_BOX_HOME_MOUNTS:-}; do
+  [ -e "$HOME/$name" ] && EXTRA+=(-v "$HOME/$name:$CONTAINER_HOME/$name")
+done
+for m in ${CLAUDE_BOX_MOUNTS:-}; do EXTRA+=(-v "$m:$m"); done
+
+ENVPASS=()
+[ -n "${ANTHROPIC_API_KEY:-}" ]    && ENVPASS+=(-e ANTHROPIC_API_KEY)
+[ -n "${ANTHROPIC_AUTH_TOKEN:-}" ] && ENVPASS+=(-e ANTHROPIC_AUTH_TOKEN)
+[ -n "${ANTHROPIC_BASE_URL:-}" ]   && ENVPASS+=(-e ANTHROPIC_BASE_URL)
+
+CMD=(claude)
+[ "$AUTO" = 1 ] && CMD+=(--dangerously-skip-permissions)
+
+# --- audio: play container sounds on the host ------------------------------
+# The container's afplay shim drops requests into a shared spool dir; this
+# background watcher plays them with the host player. Skipped if the player is
+# absent (e.g. non-macOS host) or CLAUDE_BOX_NO_AUDIO is set.
+: "${CLAUDE_BOX_PLAYER:=afplay}"
+AUDIO_RUN=()
+if [ -z "${CLAUDE_BOX_NO_AUDIO:-}" ] && command -v "$CLAUDE_BOX_PLAYER" >/dev/null 2>&1; then
+  mkdir -p "$HOME/.cache/claude-box"
+  AUDIO_SPOOL=$(mktemp -d "$HOME/.cache/claude-box/audio.XXXXXX")
+  AUDIO_RUN=(-e "CLAUDE_BOX_AUDIO_SPOOL=/claude-box-audio" -v "$AUDIO_SPOOL:/claude-box-audio")
+  (
+    set +e
+    # Safeguard: only play if the request's file argument (conventionally last)
+    # is an existing regular file with a known audio extension. Bounds a
+    # malicious/buggy request to playing real sound files — never an arbitrary
+    # path, flag, or injection string. Args are passed as quoted argv (no eval).
+    audio_ok() {
+      [ "$#" -gt 0 ] || return 1
+      local last ext
+      for last; do :; done   # last = final positional arg (the file)
+      ext=$(printf '%s' "${last##*.}" | tr '[:upper:]' '[:lower:]')
+      case "$ext" in
+        aif|aiff|aifc|wav|wave|mp3|m4a|mp4|aac|caf|snd|au|flac|ogg|oga) ;;
+        *) return 1 ;;
+      esac
+      [ -f "$last" ]
+    }
+    while [ -d "$AUDIO_SPOOL" ]; do
+      for f in "$AUDIO_SPOOL"/req.*; do
+        [ -e "$f" ] || continue
+        if [ -L "$f" ]; then rm -f "$f"; continue; fi   # ignore symlinked requests
+        args=(); while IFS= read -r line; do args+=("$line"); done < "$f"
+        rm -f "$f"
+        audio_ok "${args[@]}" && "$CLAUDE_BOX_PLAYER" "${args[@]}" >/dev/null 2>&1 &
+      done
+      sleep 0.2
+    done
+  ) &
+  AUDIO_WATCHER=$!
+  trap '[ -n "${AUDIO_WATCHER:-}" ] && kill "$AUDIO_WATCHER" 2>/dev/null; rm -rf "$AUDIO_SPOOL"' EXIT
+fi
+
+# --- run -------------------------------------------------------------------
+docker run --rm -it \
+  -u node -e "HOME=$CONTAINER_HOME" -e IS_SANDBOX=1 \
+  -e TERM -e COLORTERM \
+  "${ENVPASS[@]}" \
+  "${AUDIO_RUN[@]}" \
+  -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
+  -v "$PWD:$PWD" -w "$PWD" \
+  -v "$VOL:$CONTAINER_HOME" \
+  -v "$HOME/.claude:$CONTAINER_HOME/.claude" \
+  -v "$HOME/.claude.json:/seed/.claude.json:ro" \
+  "${GITCFG[@]}" "${EXTRA[@]}" \
+  "$RUN_IMAGE" \
+  "${CMD[@]}" "$@"
