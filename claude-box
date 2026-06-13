@@ -16,9 +16,11 @@
 
 set -euo pipefail
 
-CLAUDE_BOX_VERSION="0.4.1"
+CLAUDE_BOX_VERSION="0.5.0"
 PROJECT_DOCKERFILE=".claude/claude-box/Dockerfile"
-CONTAINER_HOME="/home/node"   # home of the non-root 'node' user in the base image
+# The box reproduces your host home path (and UID/GID/username) so paths, project
+# history, and file ownership match the host exactly.
+CONTAINER_HOME="$HOME"
 
 usage() {
   cat <<'EOF'
@@ -100,28 +102,46 @@ read -r -d '' BASE_DOCKERFILE <<'DOCKERFILE' || true
 FROM node:22-bookworm-slim
 ENV DEBIAN_FRONTEND=noninteractive IS_SANDBOX=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      git jq ripgrep curl ca-certificates less build-essential python3 unzip \
+      git jq ripgrep curl ca-certificates less build-essential python3 unzip gosu \
  && rm -rf /var/lib/apt/lists/*
 ARG CLAUDE_VERSION=latest
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_VERSION}
-RUN mkdir -p /home/node/.cache && chown -R node:node /home/node
 
-# Seed ~/.claude.json from the host each run, but STRIP the host's OAuth account
-# (.oauthAccount): inside the box that account has no credentials (they live in
-# the host Keychain), so leaving it makes Claude prompt to log in and re-onboard
-# instead of using $CLAUDE_CODE_OAUTH_TOKEN. Regenerated every start so stale
-# volumes self-heal. Keeps the rest (onboarding-complete, MCP config, etc.).
+# Entrypoint runs as root: reproduce the host user (UID/GID/name/home) so paths
+# and bind-mount file ownership match the host exactly, seed ~/.claude.json (with
+# the host OAuth account stripped, since its creds live in the host Keychain and
+# are unreadable here — otherwise Claude re-onboards/logs in instead of using
+# $CLAUDE_CODE_OAUTH_TOKEN), then drop privileges to that user with gosu.
 COPY <<'SH' /usr/local/bin/claude-box-entry
 #!/bin/sh
+uid="${HOST_UID:-1000}"
+gid="${HOST_GID:-1000}"
+home="${HOME:-/home/node}"
+user="${HOST_USER:-dev}"
+
+# Group + passwd entry for the host ids (reuse an existing group at that gid,
+# e.g. gid 20; create a passwd entry so getpwuid()/whoami/$HOME resolve).
+getent group "$gid"  >/dev/null 2>&1 || groupadd -g "$gid" "$user" 2>/dev/null || true
+getent passwd "$uid" >/dev/null 2>&1 || useradd -o -u "$uid" -g "$gid" -d "$home" -s /bin/bash -M "$user" 2>/dev/null || true
+
+# Make the home (named-volume mount point) writable by the user — top level and
+# caches only, never recursing into the bind-mounted ~/.claude or repo.
+mkdir -p "$home/.cache"
+chown "$uid:$gid" "$home" "$home/.cache" 2>/dev/null || true
+
+# Seed ~/.claude.json from the host with .oauthAccount stripped; regenerated each
+# run so stale volumes self-heal. Keeps the rest (onboarding-complete, MCP, ...).
 if [ -f /seed/.claude.json ]; then
   if command -v jq >/dev/null 2>&1 \
-     && jq 'del(.oauthAccount)' /seed/.claude.json > "$HOME/.claude.json.tmp" 2>/dev/null; then
-    mv "$HOME/.claude.json.tmp" "$HOME/.claude.json"
-  elif [ ! -f "$HOME/.claude.json" ]; then
-    cp /seed/.claude.json "$HOME/.claude.json"
+     && jq 'del(.oauthAccount)' /seed/.claude.json > "$home/.claude.json.tmp" 2>/dev/null; then
+    mv "$home/.claude.json.tmp" "$home/.claude.json"
+  elif [ ! -f "$home/.claude.json" ]; then
+    cp /seed/.claude.json "$home/.claude.json"
   fi
+  chown "$uid:$gid" "$home/.claude.json" 2>/dev/null || true
 fi
-exec "$@"
+
+exec gosu "$uid:$gid" "$@"
 SH
 
 # afplay shim: there's no audio device in the container, so forward the request
@@ -228,11 +248,11 @@ VOL="claude-box-home-$(printf '%s' "$PWD" | shasum | cut -c1-12)"
 GITCFG=()
 [ -f "$HOME/.gitconfig" ] && GITCFG=(-v "$HOME/.gitconfig:$CONTAINER_HOME/.gitconfig:ro")
 
-# Map a name under $HOME into the container home AND (when the host home differs
-# from the container home) at the host home path too. The second mount makes
-# config that uses absolute "~"-style paths resolve inside the box — e.g. a
-# statusLine command like `bash /Users/you/.claude/statusline-command.sh`, or
-# relative skill symlinks (../../.agents/...) that resolve home-relative.
+# Mount a name under $HOME at the same path in the box. The box's home IS the
+# host home path (CONTAINER_HOME=$HOME), so this resolves both absolute
+# "~"-style config paths (e.g. a statusLine command) and relative skill symlinks
+# (../../.agents/...). The second mount is a no-op now that the homes match, but
+# kept so the logic still holds if CONTAINER_HOME ever diverges.
 HOMEMAP=()
 mount_home() {
   [ -e "$HOME/$1" ] || return 0
@@ -310,8 +330,11 @@ if [ -z "${CLAUDE_BOX_NO_AUDIO:-}" ] && command -v "$CLAUDE_BOX_PLAYER" >/dev/nu
 fi
 
 # --- run -------------------------------------------------------------------
+# Start as root so the entrypoint can reproduce the host user, then it drops to
+# that user (gosu). HOST_* tell it which uid/gid/name/home to become.
 docker run --rm -it \
-  -u node -e "HOME=$CONTAINER_HOME" -e IS_SANDBOX=1 \
+  -e "HOME=$CONTAINER_HOME" -e IS_SANDBOX=1 \
+  -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" -e "HOST_USER=$(id -un)" \
   -e TERM -e COLORTERM \
   "${ENVPASS[@]}" \
   "${AUDIO_RUN[@]}" \

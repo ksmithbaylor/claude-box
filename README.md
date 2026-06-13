@@ -72,14 +72,16 @@ Three layers, generic → specific:
 | Host                     | Container                   | Why                                                                                                                                                                          |
 | ------------------------ | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `$PWD`                   | `$PWD` (same absolute path) | So Claude's per-project history/memory keys match the host. Edit/commit/push from your host as usual.                                                                        |
-| `~/.claude`              | `~/.claude`                 | Read-write: skills, `settings.json`/statusline edits, memories, and credentials written in the box persist to the host. Also mounted at the host home path so absolute `~`-style config paths (e.g. a statusLine command) resolve.                                                                                                                     |
+| `~/.claude`              | `~/.claude`                 | Read-write: skills, `settings.json`/statusline edits, memories, and credentials written in the box persist to the host. Because the box's home **is** your host home path, absolute `~`-style config paths (e.g. a statusLine command) resolve too.                                                                                                                     |
 | `~/.claude.json`         | regenerated in a home volume | Top-level config. Bind-mounting the file directly breaks Claude's atomic-rename writes, so each run it's regenerated into the container home from yours **with `.oauthAccount` stripped** — the box authenticates via `CLAUDE_CODE_OAUTH_TOKEN`, not the host account (whose creds are in the Keychain). Container-local otherwise. |
 | `~/.gitconfig`           | `~/.gitconfig` (ro)         | Commit identity (if present).                                                                                                                                                |
-| a named volume           | container `~`               | Persists caches (e.g. language package caches) between runs.                                                                                                                 |
+| a named volume           | container `~` (= host home) | Persists caches (e.g. language package caches) between runs.                                                                                                                 |
 | `~/.agents` (if present) | container `~/.agents` (ro)  | For tools that symlink into `~/.claude` with relative links. Read-only — the box reads these but shouldn't rewrite them on the host. Configurable — see [Configuration](#configuration).                                                                                                                                            |
 
-The container runs as the non-root `node` user with `IS_SANDBOX=1` so auto mode is allowed, and
-`git`'s `safe.directory` is set so in-container git works on the bind-mounted repo.
+The container runs as **your host user** — same UID/GID, username, and home path — so paths, project
+history, and bind-mount file ownership all match the host (a root entrypoint reproduces the user and
+drops privileges via `gosu`). `IS_SANDBOX=1` allows auto mode, and `git`'s `safe.directory` is set so
+in-container git works on the bind-mounted repo.
 
 ### Per-project Dockerfile
 
