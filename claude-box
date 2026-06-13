@@ -189,16 +189,23 @@ VOL="claude-box-home-$(printf '%s' "$PWD" | shasum | cut -c1-12)"
 GITCFG=()
 [ -f "$HOME/.gitconfig" ] && GITCFG=(-v "$HOME/.gitconfig:$CONTAINER_HOME/.gitconfig:ro")
 
-# Extra mounts:
-#  - CLAUDE_BOX_HOME_MOUNTS: names under $HOME mounted at the same name under the
-#    container home (default ".agents"), for tools that symlink into ~/.claude
-#    with RELATIVE links resolving home-relative.
-#  - CLAUDE_BOX_MOUNTS: host paths mounted at their SAME absolute path.
-EXTRA=()
+# Map a name under $HOME into the container home AND (when the host home differs
+# from the container home) at the host home path too. The second mount makes
+# config that uses absolute "~"-style paths resolve inside the box — e.g. a
+# statusLine command like `bash /Users/you/.claude/statusline-command.sh`, or
+# relative skill symlinks (../../.agents/...) that resolve home-relative.
+HOMEMAP=()
+mount_home() {
+  [ -e "$HOME/$1" ] || return 0
+  HOMEMAP+=(-v "$HOME/$1:$CONTAINER_HOME/$1")
+  [ "$HOME" != "$CONTAINER_HOME" ] && HOMEMAP+=(-v "$HOME/$1:$HOME/$1")
+}
+mount_home .claude
 : "${CLAUDE_BOX_HOME_MOUNTS:=.agents}"
-for name in ${CLAUDE_BOX_HOME_MOUNTS:-}; do
-  [ -e "$HOME/$name" ] && EXTRA+=(-v "$HOME/$name:$CONTAINER_HOME/$name")
-done
+for name in ${CLAUDE_BOX_HOME_MOUNTS:-}; do mount_home "$name"; done
+
+# CLAUDE_BOX_MOUNTS: arbitrary host paths mounted at their SAME absolute path.
+EXTRA=()
 for m in ${CLAUDE_BOX_MOUNTS:-}; do EXTRA+=(-v "$m:$m"); done
 
 ENVPASS=()
@@ -260,7 +267,7 @@ docker run --rm -it \
   -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
   -v "$PWD:$PWD" -w "$PWD" \
   -v "$VOL:$CONTAINER_HOME" \
-  -v "$HOME/.claude:$CONTAINER_HOME/.claude" \
+  "${HOMEMAP[@]}" \
   -v "$HOME/.claude.json:/seed/.claude.json:ro" \
   "${GITCFG[@]}" "${EXTRA[@]}" \
   "$RUN_IMAGE" \
