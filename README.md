@@ -145,7 +145,7 @@ Declare them in the Dockerfile and keep them current as services change — see 
 ## Security
 
 **Auto mode is the whole point, so think about the trust boundary.** The container can run anything,
-but can only reach what you mount. Two things to know:
+but can only reach what you mount. What that means in practice:
 
 - **Read-write mounts are reachable.** `~/.claude`, the repo, and any `CLAUDE_BOX_MOUNTS` paths are
   mounted read-write, so a misbehaving agent can modify _those host paths_ directly (e.g. deleting
@@ -168,6 +168,25 @@ but can only reach what you mount. Two things to know:
   in-box agent can write there, so treat a compromised box as able to plant host-side code via
   `settings.json` hooks. This is the same trust you extend to Claude on the host, but the writer in
   the box is unsupervised — glance at `~/.claude/settings.json` and hooks if a run felt off.
+- **The repo is an execution vector too — including its `.git/`.** The bind-mounted repo is
+  read-write, so an agent can plant a `.git/hooks/*` script or a malicious `.git/config` (e.g.
+  `core.fsmonitor`, `core.pager`, or an `alias.*` shelling out) that then runs on the **host** the
+  next time you run `git` in that repo. This is inherent to handing the box your working tree; if a
+  run felt off, `git config --local --list` and a peek at `.git/hooks` are worth it before you
+  `git commit`/`pull` on the host.
+- **Outbound network is unrestricted.** The box needs egress to reach the Claude API, but nothing
+  confines it there — a compromised run can exfiltrate anything it can read (the repo, `~/.claude`,
+  tokens in its env) or probe your LAN. Pinning egress to just the API needs a proxy/firewall and
+  isn't built in; if you need that, put the box on a locked-down Docker network. (A blanket
+  `--network none` won't work — Claude itself can't reach the API then.)
+- **Changes to host-executing files are flagged for you.** Because the two vectors above are real,
+  claude-box fingerprints the high-signal set — `~/.claude` and project `.claude` `settings*.json` /
+  `hooks/`, `.mcp.json`, and the repo's `.git/config` / `.git/hooks` — before each run and diffs it
+  after, printing any file the session **added/modified/deleted** that would run on your host, along
+  with a **unified diff of each change** so a malicious edit is obvious at a glance. The "before"
+  copies are stashed in a host temp dir that's never mounted into the box, so it can't tamper with
+  the baseline. It's a heads-up, not a gate (the box can still write them); review before you trust.
+  Disable with `CLAUDE_BOX_NO_HOOK_CHECK=1`.
 
 ## Configuration
 
@@ -179,6 +198,8 @@ All optional environment variables:
 | `CLAUDE_BOX_HOME_MOUNTS`                                            | `.agents` | Space-separated names under `$HOME` mounted **read-only** at the same name under the container home — for tools that symlink into `~/.claude` with **relative** links (the target must sit beside `.claude` in `$HOME`). |
 | `CLAUDE_BOX_PLAYER`                                                 | `afplay`  | Host command used to play forwarded sounds.                                                                                                                                                                |
 | `CLAUDE_BOX_NO_AUDIO`                                               | —         | Set to disable sound forwarding.                                                                                                                                                                           |
+| `CLAUDE_BOX_NO_HOOK_CHECK`                                          | —         | Set to disable the post-run check that flags changes to host files that execute (Claude/git hooks, `settings*.json`, `.mcp.json`). On by default.                                                            |
+| `CLAUDE_BOX_SKIP_AUTH_CHECK`                                        | —         | Set to skip the pre-flight check that bails when no host auth (token/key/`~/.claude` credentials) is visible. For when auth reaches the box another way.                                                     |
 | `CLAUDE_BOX_PIDS_LIMIT`                                             | `2048`    | Max number of processes in the box (caps fork bombs).                                                                                                                                                      |
 | `CLAUDE_BOX_MEMORY`                                                 | —         | Memory limit, passed to `docker --memory` (e.g. `8g`). Unset = no limit.                                                                                                                                   |
 | `CLAUDE_BOX_CPUS`                                                   | —         | CPU limit, passed to `docker --cpus` (e.g. `4`). Unset = no limit.                                                                                                                                         |
