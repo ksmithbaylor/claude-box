@@ -2,8 +2,10 @@
 #
 # claude-box — run Claude Code in a per-project Docker sandbox.
 #
-# Runs Claude Code in "auto mode" (--dangerously-skip-permissions) inside a
-# container so it can't touch your host. Your repo and global ~/.claude are
+# Runs Claude Code in auto mode (--permission-mode auto: a classifier auto-
+# approves routine actions but blocks dangerous ones) inside a container so it
+# can't touch your host. --yolo opts into bypassPermissions, --no-auto into
+# normal prompting. Your repo and global ~/.claude are
 # bind-mounted (so editing, skills, memory, and settings all work as usual; git
 # is mounted read-only by default, so the agent can inspect history but can't
 # commit/push — you do that on the host), every toolchain dependency lives in the
@@ -17,7 +19,7 @@
 
 set -euo pipefail
 
-CLAUDE_BOX_VERSION="0.9.0"
+CLAUDE_BOX_VERSION="0.10.0"
 PROJECT_DOCKERFILE=".claude/claude-box/Dockerfile"
 # The box reproduces your host home path (and UID/GID/username) so paths, project
 # history, and file ownership match the host exactly.
@@ -33,7 +35,10 @@ USAGE:
 OPTIONS:
   --init        Scaffold .claude/claude-box/Dockerfile in the current repo.
   --rebuild     Force a rebuild of the base and project images (no cache).
-  --no-auto     Don't pass --dangerously-skip-permissions to Claude.
+  --no-auto     Ask-every-time: run Claude in its normal prompting mode instead
+                of auto mode.
+  --yolo        Dangerous: run Claude in bypassPermissions mode — NO safety
+                checks at all. Default is auto mode (see PERMISSION MODES).
   -h, --help    Show this help.
   --version     Print the version.
 
@@ -49,6 +54,18 @@ WHAT IT DOES:
   - Runs the container with your repo bind-mounted at the SAME absolute path
     (so Claude's per-project history/memory line up), your ~/.claude mounted,
     a persistent home volume for caches, and Claude started in auto mode.
+
+PERMISSION MODES:
+  By default the box starts Claude in AUTO mode (--permission-mode auto): a
+  classifier auto-approves routine actions but blocks genuinely dangerous ones
+  (curl|bash, secret exfiltration, prod deploys, mass deletion, force-push /
+  push to main, destroying pre-existing files). Blocked actions surface to you in
+  the interactive session, so you stay in the loop on the risky stuff.
+    --no-auto  Claude's normal mode: prompts before each non-allowlisted action.
+    --yolo     bypassPermissions: no checks at all — everything runs immediately.
+  Auto mode is a Claude Code research preview and needs a capable model
+  (Opus 4.6+ / Sonnet 4.6+; not Haiku). If it's unavailable for your model, use
+  --no-auto or --yolo.
 
 AUTH (do this once on the HOST — the box can't run interactive login):
   Claude on macOS keeps credentials in the Keychain (which the Linux box can't
@@ -207,7 +224,7 @@ TMPL
 }
 
 # --- parse options ---------------------------------------------------------
-AUTO=1
+PERM_MODE=auto          # auto (default) | ask (--no-auto) | yolo (--yolo)
 REBUILD=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -215,7 +232,8 @@ while [ $# -gt 0 ]; do
     --version) echo "claude-box $CLAUDE_BOX_VERSION"; exit 0 ;;
     --init) do_init; exit $? ;;
     --rebuild) REBUILD=1; shift ;;
-    --no-auto) AUTO=0; shift ;;
+    --no-auto) PERM_MODE=ask; shift ;;
+    --yolo) PERM_MODE=yolo; shift ;;
     --) shift; break ;;
     -*) echo "claude-box: unknown option: $1 (use -- to pass flags to claude)" >&2; exit 2 ;;
     *) break ;;
@@ -329,7 +347,11 @@ ENVPASS=()
 [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && ENVPASS+=(-e CLAUDE_CODE_OAUTH_TOKEN)
 
 CMD=(claude)
-[ "$AUTO" = 1 ] && CMD+=(--dangerously-skip-permissions)
+case "$PERM_MODE" in
+  auto) CMD+=(--permission-mode auto) ;;            # classifier-gated (default)
+  yolo) CMD+=(--permission-mode bypassPermissions) ;;  # no checks at all
+  ask)  : ;;                                         # Claude's normal prompting
+esac
 
 # --- audio: play container hook sounds on the host -------------------------
 # The container's afplay shim drops requests into a shared spool; this background

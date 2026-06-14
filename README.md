@@ -1,7 +1,9 @@
 # claude-box
 
-Run [Claude Code](https://claude.com/claude-code) in a per-project Docker sandbox, so you can use
-**auto mode** (`--dangerously-skip-permissions`) without it being able to mess up your host.
+Run [Claude Code](https://claude.com/claude-code) in a per-project Docker sandbox, so you can let the
+agent run unsupervised without it being able to mess up your host. By default it starts in Claude's
+**auto mode** (a classifier auto-approves routine actions and blocks dangerous ones); `--yolo` drops
+all checks and `--no-auto` restores ask-every-time prompting (see [Permission modes](#permission-modes)).
 
 Your repo and your global `~/.claude` are bind-mounted in, so editing, skills, memory, and settings
 all work exactly as they do outside the box. **`.git` is mounted read-only by default**, so the agent
@@ -83,8 +85,9 @@ Three layers, generic → specific:
 
 The container runs as **your host user** — same UID/GID, username, and home path — so paths, project
 history, and bind-mount file ownership all match the host (a root entrypoint reproduces the user and
-drops privileges via `gosu`). `IS_SANDBOX=1` allows auto mode, and `git`'s `safe.directory` is set so
-in-container git works on the bind-mounted repo.
+drops privileges via `gosu`). `IS_SANDBOX=1` marks the environment as sandboxed (so `--yolo` /
+bypassPermissions is permitted), and `git`'s `safe.directory` is set so in-container git works on the
+bind-mounted repo.
 
 ### Per-project Dockerfile
 
@@ -218,12 +221,27 @@ All optional environment variables:
 claude-box [options] [-- claude args...]
   --init      Scaffold .claude/claude-box/Dockerfile in the current repo.
   --rebuild   Force rebuild of the base and project images (no cache).
-  --no-auto   Don't pass --dangerously-skip-permissions to Claude.
+  --no-auto   Ask-every-time: Claude's normal prompting mode.
+  --yolo      Dangerous: bypassPermissions — no safety checks at all.
   -h, --help  Show help.
   --version   Print version.
 ```
 
 Anything after the options (or a literal `--`) is passed to `claude`, e.g. `claude-box -- --resume`.
+
+## Permission modes
+
+The box maps to three of Claude Code's permission modes — by default it picks the middle one:
+
+| Flag | Claude mode | Behavior |
+| --- | --- | --- |
+| `--no-auto` | `default` | Ask every time: prompts before each non-allowlisted action. |
+| _(default)_ | `auto` | A classifier auto-approves routine actions but **blocks dangerous ones** — `curl\|bash`, secret exfiltration, prod deploys, mass deletion, force-push / push to `main`, destroying pre-existing files. Blocked actions surface in the interactive session, so you stay in the loop. |
+| `--yolo` | `bypassPermissions` | No checks at all — everything runs immediately. The container, read-only `.git`, and the hook-integrity check are then your only guardrails. |
+
+> **Auto mode is a Claude Code research preview** and needs a capable model — **Opus 4.6+ / Sonnet
+> 4.6+ (not Haiku)**; on Bedrock/Vertex/Foundry it also needs `CLAUDE_CODE_ENABLE_AUTO_MODE=1`. If
+> it's unavailable for your model, Claude reports it — use `--no-auto` or `--yolo` instead.
 
 ## Caveats
 
