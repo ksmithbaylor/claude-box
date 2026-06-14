@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-CLAUDE_BOX_VERSION="0.5.0"
+CLAUDE_BOX_VERSION="0.7.0"
 PROJECT_DOCKERFILE=".claude/claude-box/Dockerfile"
 # The box reproduces your host home path (and UID/GID/username) so paths, project
 # history, and file ownership match the host exactly.
@@ -67,6 +67,11 @@ SOUNDS:
   them with your real player. No shell evaluation happens; only existing files
   with an audio extension are played (see README "Security").
 
+PORTS:
+  Any ports the project Dockerfile EXPOSEs are published to your host on
+  localhost, so you can reach a dev server / API running in the box. The service
+  must listen on 0.0.0.0 inside the box (not 127.0.0.1) to be reachable.
+
 ENVIRONMENT:
   CLAUDE_BOX_MOUNTS       Space-separated host paths to bind-mount at the SAME
                           absolute path inside the box (e.g. absolute symlink
@@ -79,6 +84,9 @@ ENVIRONMENT:
                           rewrite them on the host.
   CLAUDE_BOX_PLAYER       Host command to play forwarded sounds. Default "afplay".
   CLAUDE_BOX_NO_AUDIO     Set to anything to disable sound forwarding.
+  CLAUDE_BOX_PIDS_LIMIT   Max processes in the box (fork-bomb cap). Default 2048.
+  CLAUDE_BOX_MEMORY       Memory limit (docker --memory, e.g. "8g"). Default: none.
+  CLAUDE_BOX_CPUS         CPU limit (docker --cpus, e.g. "4"). Default: none.
   CLAUDE_CODE_OAUTH_TOKEN Host-minted token (`claude setup-token`); forwarded so
                           the box is authenticated without an in-box login.
   ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL
@@ -131,14 +139,17 @@ chown "$uid:$gid" "$home" "$home/.cache" 2>/dev/null || true
 
 # Seed ~/.claude.json from the host with .oauthAccount stripped; regenerated each
 # run so stale volumes self-heal. Keeps the rest (onboarding-complete, MCP, ...).
+# Run AS THE USER (it owns $home): the hardened root entrypoint has no
+# CAP_DAC_OVERRIDE, so root can't write into the now-user-owned home.
 if [ -f /seed/.claude.json ]; then
-  if command -v jq >/dev/null 2>&1 \
-     && jq 'del(.oauthAccount)' /seed/.claude.json > "$home/.claude.json.tmp" 2>/dev/null; then
-    mv "$home/.claude.json.tmp" "$home/.claude.json"
-  elif [ ! -f "$home/.claude.json" ]; then
-    cp /seed/.claude.json "$home/.claude.json"
-  fi
-  chown "$uid:$gid" "$home/.claude.json" 2>/dev/null || true
+  gosu "$uid:$gid" sh -c '
+    if command -v jq >/dev/null 2>&1 \
+       && jq "del(.oauthAccount)" /seed/.claude.json > "$HOME/.claude.json.tmp" 2>/dev/null; then
+      mv -f "$HOME/.claude.json.tmp" "$HOME/.claude.json"
+    elif [ ! -f "$HOME/.claude.json" ]; then
+      cp /seed/.claude.json "$HOME/.claude.json"
+    fi
+  '
 fi
 
 exec gosu "$uid:$gid" "$@"
@@ -169,14 +180,17 @@ do_init() {
   fi
   cat > "$PROJECT_DOCKERFILE" <<'TMPL'
 # Per-project dev image for claude-box. FROM the shared base, add project deps.
+# No USER line — claude-box runs as your host user and manages privileges itself.
 ARG BASE_IMAGE=claude-box-base:latest
 FROM ${BASE_IMAGE}
 
-# Example — Deno (remove/replace with this project's toolchain):
+# Install this project's toolchain (pin versions). Example — Deno:
 # ARG DENO_VERSION=2.4.2
 # RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s "v${DENO_VERSION}"
 
-USER node
+# Expose host ports your services need; claude-box publishes them to localhost.
+# The service must listen on 0.0.0.0 inside the box to be reachable. Example:
+# EXPOSE 3000
 TMPL
   echo "Wrote $PROJECT_DOCKERFILE — edit it, then run: claude-box"
 }
@@ -259,6 +273,7 @@ mount_home() {
   local opt="${2:+:$2}"
   HOMEMAP+=(-v "$HOME/$1:$CONTAINER_HOME/$1$opt")
   [ "$HOME" != "$CONTAINER_HOME" ] && HOMEMAP+=(-v "$HOME/$1:$HOME/$1$opt")
+  return 0   # never let the trailing && short-circuit fail under `set -e`
 }
 # .claude stays read-write: the box legitimately writes memories, installs
 # skills, and updates settings there. CLAUDE_BOX_HOME_MOUNTS entries (default
@@ -329,10 +344,48 @@ if [ -z "${CLAUDE_BOX_NO_AUDIO:-}" ] && command -v "$CLAUDE_BOX_PLAYER" >/dev/nu
   trap '[ -n "${AUDIO_WATCHER:-}" ] && kill "$AUDIO_WATCHER" 2>/dev/null; rm -rf "$AUDIO_SPOOL"' EXIT
 fi
 
+# --- sandbox hardening -----------------------------------------------------
+# Drop ALL capabilities, then add back only what the trusted root entrypoint
+# needs before it drops privileges: CHOWN (own the home-volume mount point) and
+# SETUID/SETGID (gosu's privilege drop — even uid 0 can't change ids with an
+# empty cap set). After gosu, the unprivileged claude process holds none of
+# these, and no-new-privileges stops it regaining anything via the image's
+# setuid binaries (su, mount, passwd, ...). So the root window runs with 3 caps
+# instead of Docker's default 14, and the agent runs with 0.
+#   pids-limit bounds fork bombs; memory/cpus are opt-in (env) so they don't
+#   throttle large builds by default. If useradd/groupadd ever warn in practice,
+#   add --cap-add=DAC_OVERRIDE — but they write owner-writable files, so the
+#   minimal set below should suffice (and they're guarded with || true anyway).
+HARDEN=(
+  --security-opt=no-new-privileges
+  --cap-drop=ALL
+  --cap-add=CHOWN --cap-add=SETUID --cap-add=SETGID
+  --pids-limit="${CLAUDE_BOX_PIDS_LIMIT:-2048}"
+)
+[ -n "${CLAUDE_BOX_MEMORY:-}" ] && HARDEN+=(--memory="$CLAUDE_BOX_MEMORY")
+[ -n "${CLAUDE_BOX_CPUS:-}" ]   && HARDEN+=(--cpus="$CLAUDE_BOX_CPUS")
+
+# --- publish ports -----------------------------------------------------------
+# Publish to the host (loopback) any ports the project image EXPOSEs, so you can
+# reach a dev server / API / db running in the box from the host. The service
+# must listen on 0.0.0.0 inside the box (not 127.0.0.1) for the forward to reach
+# it. A host port already in use makes `docker run` fail — free it or change the
+# port. (The base image EXPOSEs nothing, so a box with no project Dockerfile
+# publishes no ports.)
+PORTS=()
+exposed=$(docker image inspect --format '{{range $p, $_ := .Config.ExposedPorts}}{{$p}} {{end}}' "$RUN_IMAGE" 2>/dev/null || true)
+for p in $exposed; do
+  num=${p%/*}; proto=${p##*/}
+  PORTS+=(-p "127.0.0.1:${num}:${num}/${proto}")
+done
+
 # --- run -------------------------------------------------------------------
-# Start as root so the entrypoint can reproduce the host user, then it drops to
-# that user (gosu). HOST_* tell it which uid/gid/name/home to become.
+# Start as root (-u 0:0, overriding any USER in the image) so the entrypoint can
+# reproduce the host user, then it drops to that user (gosu). HOST_* tell it
+# which uid/gid/name/home to become.
 docker run --rm -it \
+  -u 0:0 \
+  "${HARDEN[@]}" \
   -e "HOME=$CONTAINER_HOME" -e IS_SANDBOX=1 \
   -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" -e "HOST_USER=$(id -un)" \
   -e TERM -e COLORTERM \
@@ -343,6 +396,6 @@ docker run --rm -it \
   -v "$VOL:$CONTAINER_HOME" \
   "${HOMEMAP[@]}" \
   -v "$HOME/.claude.json:/seed/.claude.json:ro" \
-  "${GITCFG[@]}" "${EXTRA[@]}" \
+  "${GITCFG[@]}" "${EXTRA[@]}" "${PORTS[@]}" \
   "$RUN_IMAGE" \
   "${CMD[@]}" "$@"

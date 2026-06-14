@@ -91,15 +91,18 @@ in-container git works on the bind-mounted repo.
 ARG BASE_IMAGE=claude-box-base:latest
 FROM ${BASE_IMAGE}
 
-# Example — Deno:
+# Install the project toolchain (pin versions). Example — Deno:
 ARG DENO_VERSION=2.4.2
 RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s "v${DENO_VERSION}"
 
-USER node
+# Publish ports your services need (the service must bind 0.0.0.0 in the box):
+EXPOSE 7777
 ```
 
-It lives under the repo's `.claude/` directory (next to `commands/`, `hooks/`, `settings.json`), so
-it's naturally tracked with your project config. See [`examples/`](examples/) for a filled-in one.
+No `USER` line — claude-box runs as your host user and drops privileges itself. It lives under the
+repo's `.claude/` directory (next to `commands/`, `hooks/`, `settings.json`), so it's naturally
+tracked with your project config. See [`examples/`](examples/) for a filled-in one, and the
+[`claude-box-dockerfile` skill](skills/claude-box-dockerfile/SKILL.md) for the full conventions.
 
 ## Authentication
 
@@ -128,6 +131,17 @@ drops its args into a shared spool dir, and a small background watcher in the la
 with your host player. No hook changes needed. Disable with `CLAUDE_BOX_NO_AUDIO=1`; override the
 player with `CLAUDE_BOX_PLAYER`. macOS host only; skipped if the player isn't found.
 
+## Ports
+
+Any ports your project Dockerfile `EXPOSE`s are published to the host on `127.0.0.1`, so you can
+reach a dev server / API / database running in the box from your host (browser, curl, a GUI client).
+Declare them in the Dockerfile and keep them current as services change — see the
+[`claude-box-dockerfile` skill](skills/claude-box-dockerfile/SKILL.md).
+
+> The service must listen on **`0.0.0.0`** inside the box (not `127.0.0.1`), or the forward can't
+> reach it — most dev servers need a `--host 0.0.0.0` / `HOST=0.0.0.0` flag. A host port already in
+> use makes the run fail; free it or change the port.
+
 ## Security
 
 **Auto mode is the whole point, so think about the trust boundary.** The container can run anything,
@@ -143,6 +157,17 @@ but can only reach what you mount. Two things to know:
   request (`;`, `$()`, backticks, …) are inert literal filenames. As an extra safeguard, the watcher
   only plays requests whose file argument is an **existing regular file with an audio extension**,
   and ignores symlinked requests. The worst a request can do is play a real sound file.
+- **The container is hardened at the runtime level.** It runs with Docker's default seccomp profile,
+  `no-new-privileges` (so the agent can't escalate through the image's setuid binaries), and
+  `--cap-drop=ALL`. The entrypoint starts as root only long enough to reproduce your user and drop
+  privileges via `gosu`, so it keeps just three capabilities for that — `CHOWN`, `SETUID`, `SETGID`
+  — and the agent process that runs afterward holds **none**. A `--pids-limit` caps fork bombs;
+  `CLAUDE_BOX_MEMORY` / `CLAUDE_BOX_CPUS` add memory/CPU limits if you want them.
+- **`~/.claude` is read-write by design — mind that it's also an _execution_ vector.** Hooks and
+  skills under `~/.claude` run on the **host** the next time you use Claude Code natively. The
+  in-box agent can write there, so treat a compromised box as able to plant host-side code via
+  `settings.json` hooks. This is the same trust you extend to Claude on the host, but the writer in
+  the box is unsupervised — glance at `~/.claude/settings.json` and hooks if a run felt off.
 
 ## Configuration
 
@@ -154,6 +179,9 @@ All optional environment variables:
 | `CLAUDE_BOX_HOME_MOUNTS`                                            | `.agents` | Space-separated names under `$HOME` mounted **read-only** at the same name under the container home — for tools that symlink into `~/.claude` with **relative** links (the target must sit beside `.claude` in `$HOME`). |
 | `CLAUDE_BOX_PLAYER`                                                 | `afplay`  | Host command used to play forwarded sounds.                                                                                                                                                                |
 | `CLAUDE_BOX_NO_AUDIO`                                               | —         | Set to disable sound forwarding.                                                                                                                                                                           |
+| `CLAUDE_BOX_PIDS_LIMIT`                                             | `2048`    | Max number of processes in the box (caps fork bombs).                                                                                                                                                      |
+| `CLAUDE_BOX_MEMORY`                                                 | —         | Memory limit, passed to `docker --memory` (e.g. `8g`). Unset = no limit.                                                                                                                                   |
+| `CLAUDE_BOX_CPUS`                                                   | —         | CPU limit, passed to `docker --cpus` (e.g. `4`). Unset = no limit.                                                                                                                                         |
 | `CLAUDE_CODE_OAUTH_TOKEN`                                           | —         | Host-minted token (`claude setup-token`); forwarded so the box authenticates without an in-box login.                                                                                                      |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_BASE_URL` | —         | Forwarded into the container if set.                                                                                                                                                                       |
 

@@ -3,6 +3,8 @@
 # Copy to <your-repo>/.claude/claude-box/Dockerfile (or run `claude-box --init`
 # and edit), then add your project's toolchain. It FROMs the shared base image,
 # which already has Node, git, jq, ripgrep, curl, unzip, and build tools.
+#
+# No USER line — claude-box runs as your host user and manages privileges itself.
 
 ARG BASE_IMAGE=claude-box-base:latest
 FROM ${BASE_IMAGE}
@@ -14,4 +16,6 @@ RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s "v${
 
 # Add more project dependencies here (apt packages, language runtimes, CLIs...).
 
-USER node
+# Publish host ports your services need; claude-box maps them to localhost.
+# The service must listen on 0.0.0.0 inside the box to be reachable.
+# EXPOSE 7777
