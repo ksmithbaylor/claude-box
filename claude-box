@@ -4,9 +4,10 @@
 #
 # Runs Claude Code in "auto mode" (--dangerously-skip-permissions) inside a
 # container so it can't touch your host. Your repo and global ~/.claude are
-# bind-mounted (so editing, committing, skills, memory, and settings all work as
-# usual), every toolchain dependency lives in the container, and macOS hook
-# sounds are forwarded back to the host. See README.md for the full design.
+# bind-mounted (so editing, skills, memory, and settings all work as usual; git
+# is mounted read-only by default, so the agent can inspect history but can't
+# commit/push — you do that on the host), every toolchain dependency lives in the
+# container, and macOS hook sounds are forwarded back to the host. See README.md.
 #
 # This script is self-contained: the base image is defined inline and built on
 # first use. The only per-project file is .claude/claude-box/Dockerfile, which
@@ -16,7 +17,7 @@
 
 set -euo pipefail
 
-CLAUDE_BOX_VERSION="0.8.2"
+CLAUDE_BOX_VERSION="0.9.0"
 PROJECT_DOCKERFILE=".claude/claude-box/Dockerfile"
 # The box reproduces your host home path (and UID/GID/username) so paths, project
 # history, and file ownership match the host exactly.
@@ -93,6 +94,10 @@ ENVIRONMENT:
   CLAUDE_BOX_SKIP_AUTH_CHECK Set to skip the pre-flight check that bails when no
                           host auth is visible (token/key/credentials). For when
                           auth reaches the box by some other means.
+  CLAUDE_BOX_NO_READONLY_GIT Set to mount .git read-WRITE. By default .git is
+                          read-only, so the agent can read history but not commit,
+                          stage, branch, fetch, or pull — you commit/push on the
+                          host. Set this to let the box write git.
   CLAUDE_CODE_OAUTH_TOKEN Host-minted token (`claude setup-token`); forwarded so
                           the box is authenticated without an in-box login.
   ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL
@@ -302,6 +307,19 @@ for name in ${CLAUDE_BOX_HOME_MOUNTS:-}; do mount_home "$name" ro; done
 EXTRA=()
 for m in ${CLAUDE_BOX_MOUNTS:-}; do EXTRA+=(-v "$m:$m"); done
 
+# Read-only .git by default: the working tree stays writable (the agent does its
+# work there), but a nested ro mount over .git blocks all git WRITES — commit,
+# add, checkout/branch, stash, fetch/pull, local config — so the agent can read
+# history (status/diff/log/blame) but can't record anything; you commit/push on
+# the host. As a bonus it also blocks tampering with .git/hooks and .git/config
+# (a host-execution vector). Docker layers this on top of the $PWD mount since it
+# orders mounts by destination depth. Skipped when .git is a file (worktrees/
+# submodules point elsewhere). Opt out with CLAUDE_BOX_NO_READONLY_GIT.
+GITRO=()
+if [ -z "${CLAUDE_BOX_NO_READONLY_GIT:-}" ] && [ -d "$PWD/.git" ]; then
+  GITRO=(-v "$PWD/.git:$PWD/.git:ro")
+fi
+
 ENVPASS=()
 [ -n "${ANTHROPIC_API_KEY:-}" ]      && ENVPASS+=(-e ANTHROPIC_API_KEY)
 [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]   && ENVPASS+=(-e ANTHROPIC_AUTH_TOKEN)
@@ -459,6 +477,7 @@ docker run --rm -it \
   "${AUDIO_RUN[@]}" \
   -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
   -v "$PWD:$PWD" -w "$PWD" \
+  "${GITRO[@]}" \
   -v "$VOL:$CONTAINER_HOME" \
   "${HOMEMAP[@]}" \
   -v "$HOME/.claude.json:/seed/.claude.json:ro" \

@@ -3,10 +3,12 @@
 Run [Claude Code](https://claude.com/claude-code) in a per-project Docker sandbox, so you can use
 **auto mode** (`--dangerously-skip-permissions`) without it being able to mess up your host.
 
-Your repo and your global `~/.claude` are bind-mounted in, so editing, committing/pushing, skills,
-memory, and settings all work exactly as they do outside the box. Project dependencies live in the
-container. macOS notification sounds are forwarded back to the host. It's a single self-contained
-bash script — the container image is defined inline and built on first use.
+Your repo and your global `~/.claude` are bind-mounted in, so editing, skills, memory, and settings
+all work exactly as they do outside the box. **`.git` is mounted read-only by default**, so the agent
+can inspect history but can't commit, stage, branch, or push — you do that on the host (opt out with
+`CLAUDE_BOX_NO_READONLY_GIT`). Project dependencies live in the container. macOS notification sounds
+are forwarded back to the host. It's a single self-contained bash script — the container image is
+defined inline and built on first use.
 
 > Targets a **macOS host with Docker Desktop**. The audio bits are macOS-specific (and degrade
 > gracefully elsewhere); the rest is portable.
@@ -71,7 +73,8 @@ Three layers, generic → specific:
 
 | Host                     | Container                   | Why                                                                                                                                                                          |
 | ------------------------ | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `$PWD`                   | `$PWD` (same absolute path) | So Claude's per-project history/memory keys match the host. Edit/commit/push from your host as usual.                                                                        |
+| `$PWD`                   | `$PWD` (same absolute path) | So Claude's per-project history/memory keys match the host. Working tree is read-write; you commit/push from the host.                                                       |
+| `$PWD/.git`              | `$PWD/.git` (ro)            | Read-only by default so the agent can read history but not commit/stage/branch/push (or tamper with `.git/hooks`). Opt out with `CLAUDE_BOX_NO_READONLY_GIT`. Skipped for worktrees/submodules (`.git` is a file). |
 | `~/.claude`              | `~/.claude`                 | Read-write: skills, `settings.json`/statusline edits, memories, and credentials written in the box persist to the host. Because the box's home **is** your host home path, absolute `~`-style config paths (e.g. a statusLine command) resolve too.                                                                                                                     |
 | `~/.claude.json`         | regenerated in a home volume | Top-level config. Bind-mounting the file directly breaks Claude's atomic-rename writes, so each run it's regenerated into the container home from yours **with `.oauthAccount` stripped** — the box authenticates via `CLAUDE_CODE_OAUTH_TOKEN`, not the host account (whose creds are in the Keychain). Container-local otherwise. |
 | `~/.gitconfig`           | `~/.gitconfig` (ro)         | Commit identity (if present).                                                                                                                                                |
@@ -168,12 +171,14 @@ but can only reach what you mount. What that means in practice:
   in-box agent can write there, so treat a compromised box as able to plant host-side code via
   `settings.json` hooks. This is the same trust you extend to Claude on the host, but the writer in
   the box is unsupervised — glance at `~/.claude/settings.json` and hooks if a run felt off.
-- **The repo is an execution vector too — including its `.git/`.** The bind-mounted repo is
-  read-write, so an agent can plant a `.git/hooks/*` script or a malicious `.git/config` (e.g.
-  `core.fsmonitor`, `core.pager`, or an `alias.*` shelling out) that then runs on the **host** the
-  next time you run `git` in that repo. This is inherent to handing the box your working tree; if a
-  run felt off, `git config --local --list` and a peek at `.git/hooks` are worth it before you
-  `git commit`/`pull` on the host.
+- **The repo's working tree can still carry execution vectors.** `.git` is mounted **read-only by
+  default** (see [What gets mounted](#what-gets-mounted)), which blocks the classic tamper path —
+  planting a `.git/hooks/*` script or a malicious `.git/config` (`core.fsmonitor`, `core.pager`, an
+  `alias.*` shelling out) that runs on the **host** at your next `git`. But the working tree stays
+  read-write, so an agent can still write *project-level* executors the host later runs —
+  `.claude/hooks/*`, `.claude/settings*.json`, `.mcp.json`. The hook-integrity check below flags
+  those. (Opt out of read-only `.git` with `CLAUDE_BOX_NO_READONLY_GIT` and the `.git/*` path reopens
+  — those changes are flagged too.)
 - **Outbound network is unrestricted.** The box needs egress to reach the Claude API, but nothing
   confines it there — a compromised run can exfiltrate anything it can read (the repo, `~/.claude`,
   tokens in its env) or probe your LAN. Pinning egress to just the API needs a proxy/firewall and
@@ -200,6 +205,7 @@ All optional environment variables:
 | `CLAUDE_BOX_NO_AUDIO`                                               | —         | Set to disable sound forwarding.                                                                                                                                                                           |
 | `CLAUDE_BOX_NO_HOOK_CHECK`                                          | —         | Set to disable the post-run check that flags changes to host files that execute (Claude/git hooks, `settings*.json`, `.mcp.json`). On by default.                                                            |
 | `CLAUDE_BOX_SKIP_AUTH_CHECK`                                        | —         | Set to skip the pre-flight check that bails when no host auth (token/key/`~/.claude` credentials) is visible. For when auth reaches the box another way.                                                     |
+| `CLAUDE_BOX_NO_READONLY_GIT`                                        | —         | Set to mount `.git` read-**write**. By default `.git` is read-only — the agent can read history but can't commit, stage, branch, fetch, or pull (you do that on the host).                                   |
 | `CLAUDE_BOX_PIDS_LIMIT`                                             | `2048`    | Max number of processes in the box (caps fork bombs).                                                                                                                                                      |
 | `CLAUDE_BOX_MEMORY`                                                 | —         | Memory limit, passed to `docker --memory` (e.g. `8g`). Unset = no limit.                                                                                                                                   |
 | `CLAUDE_BOX_CPUS`                                                   | —         | CPU limit, passed to `docker --cpus` (e.g. `4`). Unset = no limit.                                                                                                                                         |
